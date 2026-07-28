@@ -81,6 +81,8 @@ The coordinator polls `VXengage_GetHourlyGraph` every **1 hour** (`SCAN_INTERVAL
 - Timestamps for each reading (local time, converted to UTC for HA)
 - Last-updated timestamp
 
+**Adaptive polling:** the API's `LastUpdated` marker only moves when the utility publishes new data. While the marker is unchanged between polls, the coordinator doubles its poll interval each cycle (up to **8 hours**); it resets to 1 hour as soon as new data appears. This avoids hammering the portal during the long stretches when nothing has changed.
+
 New readings are tracked via `_last_processed_start` to avoid duplicate imports. The running sum (`_current_sum`) is persisted to disk so it survives restarts.
 
 ### State Persistence
