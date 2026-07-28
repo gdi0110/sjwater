@@ -122,6 +122,10 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict:
         """Update data via scraping."""
+        # Stamp every successful poll so entities can distinguish "when we
+        # last checked" from "when the site's newest reading was" -- the
+        # utility publishes readings hours late, so the two often differ.
+        polled_at = dt_util.utcnow()
         try:
             # The API fetches data; last_processed_start filters already-seen readings.
             api_data = await self.client.async_get_data("", "", None)
@@ -130,7 +134,10 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
 
             if not history:
                 _LOGGER.debug("No history returned from API")
-                return self._build_return_data(self._current_sum or 0.0, 0.0, latest_timestamp)
+                # No readings at all: report no latest data point (the API's
+                # timestamp falls back to now() when nothing parsed, which
+                # would falsely suggest fresh data).
+                return self._build_return_data(self._current_sum or 0.0, 0.0, None, polled_at)
 
             _LOGGER.debug("API returned %d history entries", len(history))
 
@@ -244,18 +251,19 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 provisional_sum = max(provisional_sum, self._last_reported_sum)
             self._last_reported_sum = provisional_sum
 
-            return self._build_return_data(provisional_sum, today_sum, latest_timestamp)
+            return self._build_return_data(provisional_sum, today_sum, latest_timestamp, polled_at)
 
         except Exception as exc:
             _LOGGER.warning("Error fetching water data: %s", exc)
             raise
 
-    def _build_return_data(self, current_sum: float, today_sum: float, latest_timestamp) -> dict:
+    def _build_return_data(self, current_sum: float, today_sum: float, latest_timestamp, polled_at: datetime) -> dict:
         """Build the data dict returned to sensor entities."""
         return {
             "current_sum": current_sum,
             "today_sum": today_sum,
             "timestamp": latest_timestamp,
+            "polled_at": polled_at,
         }
 
     def _import_stats(self, stats: list[dict]) -> None:

@@ -53,7 +53,14 @@ The `<hash>` is the first 8 characters of SHA-256 of the username — a stable, 
 
 ### Attributes
 
-- **Water Meter Total** includes a `recorded_at` attribute with the timestamp of the most recent reading from the API.
+Both sensors include two freshness attributes:
+
+| Attribute | Description |
+|-----------|-------------|
+| `last_polled_at` | When the integration last successfully polled the SJ Water Hub portal. |
+| `latest_data_point_at` | Timestamp of the most recent reading the portal actually had (`None` if no readings were returned). |
+
+The utility publishes hourly readings 6–24 hours late, so these routinely differ: e.g. a poll at 11am (`last_polled_at`) may find the newest reading (`latest_data_point_at`) is from yesterday evening. On a failed poll the previous data is retained, so `last_polled_at` reflects the last *successful* poll.
 
 ## Energy Dashboard Setup
 
