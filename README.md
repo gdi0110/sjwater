@@ -89,6 +89,12 @@ The coordinator maintains a running total across restarts using `Store` — Home
 
 This prevents the "midnight reset" artifact where a restart could re-import the day's data from `sum=0` and clobber the accumulated total.
 
+## Security & Privacy
+
+- **Credential storage:** Your SJ Water Hub username and password are stored as plaintext in Home Assistant's config entry storage (`.storage/core.config_entries`). This is inherent to how HA integrations persist credentials — there is no secrets API for config entries. Because HA backups include `.storage`, anyone with access to your config directory or backup archives can read them. **Use a unique password for your SJ Water Hub account** — not one you reuse anywhere else.
+- **Session tokens** are kept in memory only and are never written to disk.
+- **Debug logs** (`custom_components.sjwater: debug`) may include account details returned by the portal. Review logs before sharing them in bug reports or forums.
+
 ## Technical Details
 
 | Property | Value |
