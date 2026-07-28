@@ -75,7 +75,7 @@ After authentication, the session token is stored and refreshed on each API call
 
 ### Data Fetching
 
-The coordinator polls `VXengage_GetHourlyGraph` every **1 hour** (`SCAN_INTERVAL = timedelta(hours=1)`). Each fetch returns:
+The coordinator polls `VXengage_GetHourlyGraph` every **4 hours** (`SCAN_INTERVAL = timedelta(hours=4)`). Each fetch returns:
 
 - Per-hour water consumption in gallons (delta values, not cumulative)
 - Timestamps for each reading (local time, converted to UTC for HA)
@@ -96,7 +96,7 @@ This prevents the "midnight reset" artifact where a restart could re-import the 
 | Domain | `sjwater` |
 | Integration type | Hub |
 | IoT class | Cloud Polling |
-| Update interval | 1 hour |
+| Update interval | 4 hours |
 | Dependencies | `recorder` |
 | API endpoint | `https://www.sjwaterhub.com/api/WebApi/RequestBroker` |
 | Authentication | Session token + anti-forgery token |
