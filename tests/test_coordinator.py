@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import pytest
 from homeassistant.util import dt as dt_util
 
-from custom_components.sjwater.coordinator import SJWaterHubCoordinator
+from custom_components.sjwater.coordinator import (
+    MAX_SCAN_INTERVAL,
+    SCAN_INTERVAL,
+    SJWaterHubCoordinator,
+)
 
 
 class TestAsyncInitialize:
@@ -339,6 +343,62 @@ class TestWatermarkRepair:
 
         assert coordinator._last_processed_start == 1717000000
         mock_store.async_save.assert_not_called()
+
+
+class TestAdaptPollInterval:
+    def test_backs_off_when_marker_unchanged(self, coordinator):
+        coordinator._adapt_poll_interval("2024-06-06T12:00:00")  # first sighting
+        assert coordinator.update_interval == SCAN_INTERVAL
+
+        coordinator._adapt_poll_interval("2024-06-06T12:00:00")
+        assert coordinator.update_interval == SCAN_INTERVAL * 2
+
+        coordinator._adapt_poll_interval("2024-06-06T12:00:00")
+        assert coordinator.update_interval == SCAN_INTERVAL * 4
+
+    def test_backoff_capped_at_max(self, coordinator):
+        coordinator._last_server_update = "2024-06-06T12:00:00"
+
+        for _ in range(10):
+            coordinator._adapt_poll_interval("2024-06-06T12:00:00")
+
+        assert coordinator.update_interval == MAX_SCAN_INTERVAL
+
+    def test_resets_when_marker_changes(self, coordinator):
+        coordinator._last_server_update = "2024-06-06T12:00:00"
+        coordinator.update_interval = MAX_SCAN_INTERVAL
+
+        coordinator._adapt_poll_interval("2024-06-07T12:00:00")
+
+        assert coordinator.update_interval == SCAN_INTERVAL
+        assert coordinator._last_server_update == "2024-06-07T12:00:00"
+
+    def test_keeps_base_interval_without_marker(self, coordinator):
+        coordinator._last_server_update = "2024-06-06T12:00:00"
+        coordinator.update_interval = MAX_SCAN_INTERVAL
+
+        coordinator._adapt_poll_interval("")
+
+        assert coordinator.update_interval == SCAN_INTERVAL
+        assert coordinator._last_server_update is None
+
+    async def test_update_data_triggers_adaptation(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 0,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": [],
+        })):
+            with patch.object(coordinator, "_import_stats"):
+                await coordinator._async_update_data()
+                assert coordinator.update_interval == SCAN_INTERVAL
+
+                await coordinator._async_update_data()
+                assert coordinator.update_interval == SCAN_INTERVAL * 2
 
 
 class TestImportStats:

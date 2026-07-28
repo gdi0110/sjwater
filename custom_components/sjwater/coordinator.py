@@ -25,6 +25,10 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=1)
 
+# Upper bound for adaptive backoff: while the server's LastUpdated marker is
+# unchanged, the poll interval doubles each poll up to this cap.
+MAX_SCAN_INTERVAL = timedelta(hours=8)
+
 # The utility publishes hourly readings 6-24h late and may revise them after
 # the fact; the API pads the current day with 0.0 placeholder rows for hours
 # that have not elapsed yet. Buckets younger than this stay "provisional":
@@ -68,6 +72,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         self._current_sum: float | None = None
         self._last_processed_start: int | None = None
         self._last_reported_sum: float | None = None
+        self._last_server_update: str | None = None
         self._initialized = False
         _LOGGER.debug("%s: Coordinator created", DOMAIN)
 
@@ -127,6 +132,8 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             api_data = await self.client.async_get_data("", "", None)
             history = api_data.get("history", [])
             latest_timestamp = api_data.get("timestamp")
+
+            self._adapt_poll_interval(api_data.get("last_updated"))
 
             if not history:
                 _LOGGER.debug("No history returned from API")
@@ -257,6 +264,43 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             "today_sum": today_sum,
             "timestamp": latest_timestamp,
         }
+
+    def _adapt_poll_interval(self, last_updated: str | None) -> None:
+        """Adapt the poll interval from the server's LastUpdated marker.
+
+        The utility only has new readings when its own data changes, which
+        the API exposes via LastUpdated. While the marker is unchanged the
+        poll interval doubles each poll (up to MAX_SCAN_INTERVAL); it resets
+        to SCAN_INTERVAL as soon as the marker moves. Without a marker we
+        cannot detect server-side changes, so the base interval is kept.
+        """
+        if not last_updated:
+            self._last_server_update = None
+            if self.update_interval != SCAN_INTERVAL:
+                _LOGGER.debug(
+                    "No LastUpdated marker; resetting poll interval to %s",
+                    SCAN_INTERVAL,
+                )
+                self.update_interval = SCAN_INTERVAL
+            return
+
+        if last_updated != self._last_server_update:
+            self._last_server_update = last_updated
+            if self.update_interval != SCAN_INTERVAL:
+                _LOGGER.debug(
+                    "Server data changed; resetting poll interval to %s",
+                    SCAN_INTERVAL,
+                )
+                self.update_interval = SCAN_INTERVAL
+            return
+
+        new_interval = min(self.update_interval * 2, MAX_SCAN_INTERVAL)
+        if new_interval != self.update_interval:
+            _LOGGER.debug(
+                "Server data unchanged; backing off poll interval to %s",
+                new_interval,
+            )
+            self.update_interval = new_interval
 
     def _import_stats(self, stats: list[dict]) -> None:
         """Import statistics rows for newly-seen hourly buckets.
