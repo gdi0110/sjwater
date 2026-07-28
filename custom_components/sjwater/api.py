@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -16,6 +17,12 @@ BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+# Bound how long any single request to the portal may take. aiohttp's
+# default (5 minutes total) would let a stalled connection block the
+# coordinator update cycle for minutes and mask outages behind generic
+# update failures.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
 class InvalidAuth(HomeAssistantError):
@@ -68,7 +75,7 @@ class SJWaterHubApiClient:
 
         _LOGGER.debug("Sending RequestBroker Actions: %s", actions)
 
-        async with self.session.post(self.base_url, data=json.dumps(outer_payload), headers=headers) as response:
+        async with self.session.post(self.base_url, data=json.dumps(outer_payload), headers=headers, timeout=REQUEST_TIMEOUT) as response:
             response.raise_for_status()
             response_json = await response.json()
             return response_json
@@ -84,7 +91,7 @@ class SJWaterHubApiClient:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with self.session.get(login_url, headers=get_headers) as page_response:
+        async with self.session.get(login_url, headers=get_headers, timeout=REQUEST_TIMEOUT) as page_response:
             page_response.raise_for_status()
             html = await page_response.text()
 
@@ -111,6 +118,7 @@ class SJWaterHubApiClient:
             "https://www.sjwaterhub.com/api/WebApi/CreateExceptionPermissions",
             data={"token": self._token, "sitePrefix": ""},
             headers=exc_headers,
+            timeout=REQUEST_TIMEOUT,
         ) as exc_response:
             _LOGGER.debug("CreateExceptionPermissions status: %s", exc_response.status)
 
@@ -165,6 +173,8 @@ class SJWaterHubApiClient:
         """
         try:
             success = await self.async_login()
+        except asyncio.TimeoutError as err:
+            raise CannotConnect(f"Timed out connecting to SJ Water Hub: {err}") from err
         except aiohttp.ClientError as err:
             raise CannotConnect(f"Cannot reach SJ Water Hub: {err}") from err
         except Exception as err:
