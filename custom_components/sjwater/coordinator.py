@@ -68,6 +68,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         self._current_sum: float | None = None
         self._last_processed_start: int | None = None
         self._last_reported_sum: float | None = None
+        self._last_import_signature: list | None = None
         self._initialized = False
         _LOGGER.debug("%s: Coordinator created", DOMAIN)
 
@@ -234,8 +235,19 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                     len(provisional), provisional_sum,
                 )
 
+            # The provisional window is rebuilt on top of the finalized sum
+            # every poll, so repeat polls within the same hour (restarts,
+            # manual refreshes, unchanged API responses) produce an identical
+            # batch. Skip the recorder upsert when nothing changed; only
+            # record the signature after a successful import so a failed
+            # import is retried on the next poll.
             if total_stats:
-                self._import_stats(total_stats)
+                signature = [
+                    (row["start"], row["state"], row["sum"]) for row in total_stats
+                ]
+                if signature != self._last_import_signature:
+                    if self._import_stats(total_stats):
+                        self._last_import_signature = signature
 
             # Never report a lower total than a previous poll: a downward
             # provisional revision would otherwise read as a meter reset to
@@ -258,13 +270,17 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             "timestamp": latest_timestamp,
         }
 
-    def _import_stats(self, stats: list[dict]) -> None:
+    def _import_stats(self, stats: list[dict]) -> bool:
         """Import statistics rows for newly-seen hourly buckets.
 
         Only rows past ``_last_processed_start`` reach this point, so the
         ``sum`` values always extend the existing series — preventing the
         "midnight reset" artifact where a restart re-imported the day from
         sum=0 and clobbered yesterday's accumulated total.
+
+        Returns True when the rows were handed to the recorder, False when
+        the import raised — so the caller can retry the same batch on the
+        next poll instead of treating it as imported.
         """
         from homeassistant.components.recorder.models import StatisticMeanType
         from homeassistant.components.recorder.statistics import async_import_statistics
@@ -285,5 +301,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             _LOGGER.debug(
                 "Imported %d stats (last sum=%.1f)", len(stats), stats[-1]["sum"]
             )
+            return True
         except Exception as exc:
             _LOGGER.debug("Failed to import statistics: %s", exc)
+            return False

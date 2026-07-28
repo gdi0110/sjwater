@@ -81,7 +81,7 @@ The coordinator polls `VXengage_GetHourlyGraph` every **1 hour** (`SCAN_INTERVAL
 - Timestamps for each reading (local time, converted to UTC for HA)
 - Last-updated timestamp
 
-New readings are tracked via `_last_processed_start` to avoid duplicate imports. The running sum (`_current_sum`) is persisted to disk so it survives restarts.
+New readings are tracked via `_last_processed_start` to avoid duplicate imports. The running sum (`_current_sum`) is persisted to disk so it survives restarts. Identical statistics batches (e.g., repeat polls within the same hour) are detected and skipped to avoid redundant recorder writes.
 
 ### State Persistence
 

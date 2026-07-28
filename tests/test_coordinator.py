@@ -341,6 +341,90 @@ class TestWatermarkRepair:
         mock_store.async_save.assert_not_called()
 
 
+class TestStatsImportDedup:
+    async def test_skips_import_when_batch_unchanged(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        # Provisional entries (younger than FINALIZATION_LAG)
+        history = [
+            {"start": now - timedelta(hours=2), "state": "1.5"},
+            {"start": now - timedelta(hours=1), "state": "2.5"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 2.5,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+                    await coordinator._async_update_data()
+
+        assert mock_import.call_count == 1
+
+    async def test_reimports_when_batch_changes(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        history = [
+            {"start": now - timedelta(hours=2), "state": "1.5"},
+            {"start": now - timedelta(hours=1), "state": "2.5"},
+        ]
+        revised_history = history + [
+            {"start": now - timedelta(hours=1), "state": "3.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(side_effect=[
+            {
+                "gallons": 2.5,
+                "timestamp": now,
+                "last_updated": "2024-06-06T12:00:00",
+                "history": history,
+            },
+            {
+                "gallons": 3.0,
+                "timestamp": now,
+                "last_updated": "2024-06-06T13:00:00",
+                "history": revised_history,
+            },
+        ])):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+                    await coordinator._async_update_data()
+
+        assert mock_import.call_count == 2
+
+    async def test_retries_when_import_fails(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        history = [
+            {"start": now - timedelta(hours=1), "state": "2.5"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 2.5,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats", return_value=False) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+                    await coordinator._async_update_data()
+
+        # Failed imports are not recorded as imported, so the next poll
+        # with an identical batch retries the import.
+        assert mock_import.call_count == 2
+
+
 class TestImportStats:
     async def test_imports_statistics_correctly(self, coordinator):
         import sys, types
