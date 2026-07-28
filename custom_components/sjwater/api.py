@@ -126,9 +126,15 @@ class SJWaterHubApiClient:
 
         data = await self._post_request("VXengage_Login", "Login", login_additions)
 
+        # Log only non-sensitive status fields. The full response carries the
+        # session Token and PII in Transaction.Attributes (account holder
+        # name, service address, email, etc.), so it must never be dumped
+        # to the log.
         _LOGGER.debug(
-            "Login response (Token redacted): %s",
-            json.dumps({k: v for k, v in data.items() if k != "Token"}, default=str),
+            "Login response: Success=%s, Authorized=%s, Valid=%s",
+            data.get("VXengage_Login", {}).get("Success"),
+            data.get("Authorized"),
+            data.get("Valid"),
         )
 
         _LOGGER.debug("Login completed")
