@@ -113,6 +113,9 @@ class SJWaterHubApiClient:
             headers=exc_headers,
         ) as exc_response:
             _LOGGER.debug("CreateExceptionPermissions status: %s", exc_response.status)
+            # A failure here used to go unnoticed and only surface later as a
+            # cryptic login rejection; fail fast with the real cause.
+            exc_response.raise_for_status()
 
         # 3. Use the extracted token to login
         login_additions = {
