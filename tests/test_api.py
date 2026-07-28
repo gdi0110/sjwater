@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import json
 from unittest.mock import MagicMock, patch
@@ -8,6 +9,7 @@ import aiohttp
 import pytest
 
 from custom_components.sjwater.api import (
+    REQUEST_TIMEOUT,
     CannotConnect,
     InvalidAuth,
     SJWaterHubApiClient,
@@ -128,6 +130,31 @@ class TestAsyncVerifyCredentials:
         mock_session.get.return_value = resp
 
         with pytest.raises(CannotConnect, match="Unexpected error"):
+            await api_client.async_verify_credentials()
+
+
+class TestRequestTimeouts:
+    async def test_login_requests_pass_timeout(self, api_client, mock_session, mock_get_factory, mock_post_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        mock_post_factory(data=load_json_fixture("login_success.json"))
+
+        await api_client.async_login()
+
+        assert mock_session.get.call_args[1].get("timeout") is REQUEST_TIMEOUT
+        for post_call in mock_session.post.call_args_list:
+            assert post_call[1].get("timeout") is REQUEST_TIMEOUT
+
+    async def test_data_request_passes_timeout(self, authenticated_client, mock_session, mock_post_factory):
+        mock_post_factory(data=load_json_fixture("hourly_graph_success.json"))
+
+        await authenticated_client.async_get_data()
+
+        assert mock_session.post.call_args[1].get("timeout") is REQUEST_TIMEOUT
+
+    async def test_timeout_raises_cannot_connect(self, api_client, mock_session):
+        mock_session.get.side_effect = asyncio.TimeoutError("timed out")
+
+        with pytest.raises(CannotConnect, match="Timed out"):
             await api_client.async_verify_credentials()
 
 
