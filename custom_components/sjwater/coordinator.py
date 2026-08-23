@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING
+
+from dateutil.parser import parse as dt_parse
 
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
@@ -17,21 +20,26 @@ from .api import SJWaterHubApiClient
 from .const import DOMAIN
 
 if TYPE_CHECKING:
-    from homeassistant.components.recorder.models import StatisticMeanType
-    from homeassistant.components.recorder.statistics import async_import_statistics
     from homeassistant.config_entries import ConfigEntry as SJWaterConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=1)
 
-# The utility publishes hourly readings 6-24h late and may revise them after
-# the fact; the API pads the current day with 0.0 placeholder rows for hours
-# that have not elapsed yet. Buckets younger than this stay "provisional":
-# they are rebuilt and re-imported on every poll (statistics import upserts
-# by hour start, so corrections overwrite placeholders) and only buckets
-# older than this are finalized into the persisted running sum.
+# The utility publishes hourly readings several hours late and may revise
+# them after the fact. Buckets younger than this stay "provisional": they are
+# rebuilt and re-imported on every poll (external statistics upsert by hour
+# start, so corrections overwrite earlier values) and only buckets older than
+# this are finalized into the persisted running sum.
 FINALIZATION_LAG = timedelta(hours=48)
+
+# Statistics are written to an *external* statistic id ("sjwater:<acct>_...")
+# via async_add_external_statistics rather than into the sensor entity's own
+# series. The recorder compiles the entity series itself every hour; writing
+# into it for hours the recorder has not finalized yet raced that compile and
+# raised "UNIQUE constraint failed: statistics.metadata_id, statistics.start_ts",
+# which aborted statistics for *every* entity in Home Assistant (issue #10).
+STATISTIC_ID_SUFFIX = "water_usage"
 
 
 class SJWaterHubCoordinator(DataUpdateCoordinator):
@@ -114,11 +122,19 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         self._initialized = True
 
     @property
+    def account_id(self) -> str:
+        """Return the short stable non-PII identifier for this account."""
+        return hashlib.sha256(self.client.username.encode()).hexdigest()[:8]
+
+    @property
     def entity_id(self) -> str:
         """Return the sensor entity_id for this coordinator's account."""
-        import hashlib
-        acct = hashlib.sha256(self.client.username.encode()).hexdigest()[:8]
-        return f"sensor.sjwater_{acct}_water_usage"
+        return f"sensor.sjwater_{self.account_id}_{STATISTIC_ID_SUFFIX}"
+
+    @property
+    def statistic_id(self) -> str:
+        """Return the external statistic id the hourly usage is imported to."""
+        return f"{DOMAIN}:{self.account_id}_{STATISTIC_ID_SUFFIX}"
 
     async def _async_update_data(self) -> dict:
         """Update data via scraping."""
@@ -147,7 +163,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                         today_sum += max(0.0, float(entry.get("state", 0.0)))
 
             now_utc = dt_util.utcnow()
-            now_ts = int(now_utc.timestamp())
+            import_cutoff_ts = self._import_cutoff_ts(now_utc, api_data.get("last_updated"))
             finalize_cutoff_ts = int((now_utc - FINALIZATION_LAG).timestamp())
 
             new_sum = self._current_sum or 0.0
@@ -159,8 +175,10 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             # per bucket), not a cumulative meter reading. Buckets older than
             # FINALIZATION_LAG are folded into the persisted running sum once;
             # younger buckets are set aside as provisional because the utility
-            # publishes readings late and may revise them. Buckets in the
-            # future are placeholders the API pads the current day with.
+            # publishes readings late and may revise them. Buckets at or after
+            # the import cutoff (the in-progress hour, and anything the portal
+            # has not published yet per LastUpdated) are "0" placeholders the
+            # API pads the current day with and must never be imported.
             for entry in history:
                 entry_start_dt = entry.get("start")
                 entry_state = max(0.0, float(entry.get("state", 0.0)))
@@ -170,7 +188,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 else:
                     continue
 
-                if entry_ts > now_ts:
+                if entry_ts >= import_cutoff_ts:
                     continue
 
                 if entry_ts > finalize_cutoff_ts:
@@ -250,6 +268,29 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Error fetching water data: %s", exc)
             raise
 
+    @staticmethod
+    def _import_cutoff_ts(now_utc: datetime, last_updated: str | None) -> int:
+        """Return the epoch second at/after which hourly buckets are ignored.
+
+        Buckets whose start is at or after the current hour's start are still
+        in progress. Buckets at or after the portal's ``LastUpdated`` marker
+        have not been published yet and are returned as "0" placeholders.
+        Whichever is earlier wins; an unparseable marker falls back to the
+        current hour.
+        """
+        cutoff = now_utc.replace(minute=0, second=0, microsecond=0)
+        if last_updated:
+            try:
+                marker = dt_parse(str(last_updated))
+                if marker.tzinfo is None:
+                    marker = marker.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+                marker = marker.astimezone(timezone.utc)
+                if marker < cutoff:
+                    cutoff = marker
+            except (ValueError, TypeError, OverflowError) as err:
+                _LOGGER.debug("Ignoring unparseable LastUpdated %r: %s", last_updated, err)
+        return int(cutoff.timestamp())
+
     def _build_return_data(self, current_sum: float, today_sum: float, latest_timestamp) -> dict:
         """Build the data dict returned to sensor entities."""
         return {
@@ -259,29 +300,35 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         }
 
     def _import_stats(self, stats: list[dict]) -> None:
-        """Import statistics rows for newly-seen hourly buckets.
+        """Import hourly buckets into the external ``sjwater:`` statistic.
 
-        Only rows past ``_last_processed_start`` reach this point, so the
-        ``sum`` values always extend the existing series — preventing the
-        "midnight reset" artifact where a restart re-imported the day from
-        sum=0 and clobbered yesterday's accumulated total.
+        Finalized rows only ever extend the series (they are past
+        ``_last_processed_start``) and provisional rows are upserted on every
+        poll, so ``sum`` always continues from the persisted running total —
+        preventing the "midnight reset" artifact where a restart re-imported
+        the day from sum=0 and clobbered yesterday's accumulated total.
         """
-        from homeassistant.components.recorder.models import StatisticMeanType
-        from homeassistant.components.recorder.statistics import async_import_statistics
+        from homeassistant.components.recorder.statistics import (
+            async_add_external_statistics,
+        )
+
+        metadata = {
+            "statistic_id": self.statistic_id,
+            "source": DOMAIN,
+            "has_sum": True,
+            "name": "SJ Water Hub Water Usage",
+            "unit_class": VolumeConverter.UNIT_CLASS,
+            "unit_of_measurement": UnitOfVolume.GALLONS,
+        }
         try:
-            async_import_statistics(
-                self.hass,
-                metadata={
-                    "statistic_id": self.entity_id,
-                    "source": "recorder",
-                    "mean_type": StatisticMeanType.NONE,
-                    "has_sum": True,
-                    "name": "Water Meter Total",
-                    "unit_class": VolumeConverter.UNIT_CLASS,
-                    "unit_of_measurement": UnitOfVolume.GALLONS,
-                },
-                statistics=stats,
-            )
+            # HA 2025.4+ replaced ``has_mean`` with ``mean_type``.
+            from homeassistant.components.recorder.models import StatisticMeanType
+            metadata["mean_type"] = StatisticMeanType.NONE
+        except ImportError:
+            metadata["has_mean"] = False
+
+        try:
+            async_add_external_statistics(self.hass, metadata, stats)
             _LOGGER.debug(
                 "Imported %d stats (last sum=%.1f)", len(stats), stats[-1]["sum"]
             )

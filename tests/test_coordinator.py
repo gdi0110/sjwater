@@ -8,6 +8,18 @@ from homeassistant.util import dt as dt_util
 
 from custom_components.sjwater.coordinator import SJWaterHubCoordinator
 
+# LastUpdated marker far enough ahead that it never cuts off test history.
+PUBLISHED_EVERYTHING = "2099-01-01T00:00:00+00:00"
+
+
+def _api_data(history, now, last_updated=PUBLISHED_EVERYTHING):
+    return {
+        "gallons": float(history[-1]["state"]) if history else 0.0,
+        "timestamp": now,
+        "last_updated": last_updated,
+        "history": history,
+    }
+
 
 class TestAsyncInitialize:
     async def test_restores_state_from_store(self, coordinator, mock_store):
@@ -55,7 +67,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.5,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats") as mock_import:
@@ -81,7 +93,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats") as mock_import:
@@ -98,7 +110,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": [],
         })):
             with patch.object(coordinator, "_import_stats") as mock_import:
@@ -122,7 +134,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 3.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -154,7 +166,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 3.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -176,7 +188,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -198,7 +210,7 @@ class TestAsyncUpdateData:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 3.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -223,7 +235,7 @@ class TestFinalizationWindow:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 0.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats") as mock_import:
@@ -247,7 +259,7 @@ class TestFinalizationWindow:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats") as mock_import:
@@ -277,7 +289,7 @@ class TestFinalizationWindow:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -303,7 +315,7 @@ class TestFinalizationWindow:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.0,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats"):
@@ -313,6 +325,87 @@ class TestFinalizationWindow:
         # A downward provisional revision must not make the TOTAL_INCREASING
         # sensor dip (HA would read it as a meter reset).
         assert result["current_sum"] == 20.0
+
+
+class TestImportCutoff:
+    async def test_in_progress_hour_excluded(self, coordinator, mock_store):
+        """The bucket for the current hour is never imported (issue #10)."""
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow().replace(minute=30, second=0, microsecond=0)
+        this_hour = now.replace(minute=0)
+        history = [
+            {"start": this_hour - timedelta(hours=1), "state": "2.0"},
+            {"start": this_hour, "state": "0.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value=_api_data(history, now))):
+            with patch.object(coordinator, "_import_stats") as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.utcnow", return_value=now):
+                    with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                        result = await coordinator._async_update_data()
+
+        assert result["current_sum"] == 2.0
+        rows = mock_import.call_args[0][0]
+        assert [r["start"] for r in rows] == [this_hour - timedelta(hours=1)]
+
+    async def test_buckets_after_last_updated_excluded(self, coordinator, mock_store):
+        """Placeholder zeros past the portal's LastUpdated marker are skipped."""
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow().replace(minute=30, second=0, microsecond=0)
+        this_hour = now.replace(minute=0)
+        last_updated = this_hour - timedelta(hours=3)
+        history = [
+            {"start": this_hour - timedelta(hours=5), "state": "7.0"},
+            {"start": this_hour - timedelta(hours=4), "state": "15.0"},
+            {"start": this_hour - timedelta(hours=3), "state": "0.0"},
+            {"start": this_hour - timedelta(hours=2), "state": "0.0"},
+            {"start": this_hour - timedelta(hours=1), "state": "0.0"},
+        ]
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(history, now, last_updated.isoformat())),
+        ):
+            with patch.object(coordinator, "_import_stats") as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.utcnow", return_value=now):
+                    with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                        result = await coordinator._async_update_data()
+
+        assert result["current_sum"] == 22.0
+        rows = mock_import.call_args[0][0]
+        assert [r["start"] for r in rows] == [
+            this_hour - timedelta(hours=5),
+            this_hour - timedelta(hours=4),
+        ]
+        assert [r["sum"] for r in rows] == [7.0, 22.0]
+
+    def test_cutoff_defaults_to_current_hour(self):
+        now = datetime(2026, 8, 23, 15, 41, 12, tzinfo=timezone.utc)
+        expected = int(datetime(2026, 8, 23, 15, 0, tzinfo=timezone.utc).timestamp())
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, None) == expected
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, "") == expected
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, "not a date") == expected
+        # A marker in the future never moves the cutoff forward.
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, "2099-01-01T00:00:00+00:00") == expected
+
+    def test_cutoff_honours_last_updated_with_offset(self):
+        # Real marker from the portal: 05:00-06:00 == 11:00Z.
+        now = datetime(2026, 8, 23, 15, 41, 12, tzinfo=timezone.utc)
+        expected = int(datetime(2026, 8, 23, 11, 0, tzinfo=timezone.utc).timestamp())
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, "2026-08-23T05:00:00-06:00") == expected
+
+    def test_cutoff_treats_naive_marker_as_local(self):
+        now = datetime(2026, 8, 23, 15, 41, 12, tzinfo=timezone.utc)
+        naive = "2026-08-23T05:00:00"
+        expected = int(
+            datetime(2026, 8, 23, 5, 0, tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            .astimezone(timezone.utc).timestamp()
+        )
+        assert SJWaterHubCoordinator._import_cutoff_ts(now, naive) == expected
 
 
 class TestWatermarkRepair:
@@ -350,6 +443,7 @@ class TestImportStats:
         recorder_models.StatisticMeanType.NONE = "NONE"
 
         recorder_stats = types.ModuleType("homeassistant.components.recorder.statistics")
+        recorder_stats.async_add_external_statistics = MagicMock()
         recorder_stats.async_import_statistics = MagicMock()
 
         sys.modules["homeassistant.components.recorder.models"] = recorder_models
@@ -361,22 +455,21 @@ class TestImportStats:
         ]
 
         coordinator.client.username = "test@example.com"
-        expected_entity_id = coordinator.entity_id
+        coordinator._import_stats(stats)
 
-        with patch.object(
-            type(coordinator), "entity_id",
-            new_callable=PropertyMock,
-            return_value=expected_entity_id,
-        ):
-            coordinator._import_stats(stats)
-
-        mock_import = recorder_stats.async_import_statistics
+        # Must go through the *external* statistics API with a "sjwater:" id,
+        # never into the sensor entity's own recorder-compiled series.
+        recorder_stats.async_import_statistics.assert_not_called()
+        mock_import = recorder_stats.async_add_external_statistics
         mock_import.assert_called_once()
-        call_args = mock_import.call_args
-        assert call_args[0][0] == coordinator.hass
-        assert call_args[1]["metadata"]["statistic_id"] == expected_entity_id
-        assert call_args[1]["metadata"]["has_sum"] is True
-        assert call_args[1]["statistics"] == stats
+        hass_arg, metadata, rows = mock_import.call_args[0]
+        assert hass_arg == coordinator.hass
+        assert metadata["statistic_id"] == coordinator.statistic_id
+        assert metadata["statistic_id"].startswith("sjwater:")
+        assert metadata["source"] == "sjwater"
+        assert metadata["has_sum"] is True
+        assert metadata["mean_type"] == "NONE"
+        assert rows == stats
 
     async def test_import_stats_exception_swallowed(self, coordinator):
         import sys, types
@@ -386,7 +479,7 @@ class TestImportStats:
         recorder_models.StatisticMeanType.NONE = "NONE"
 
         recorder_stats = types.ModuleType("homeassistant.components.recorder.statistics")
-        recorder_stats.async_import_statistics = MagicMock(
+        recorder_stats.async_add_external_statistics = MagicMock(
             side_effect=Exception("Import failed")
         )
 
@@ -398,10 +491,9 @@ class TestImportStats:
         ]
 
         coordinator.client.username = "test@example.com"
-        with patch.object(type(coordinator), "entity_id", new_callable=PropertyMock, return_value="sensor.sjwater_test_water_usage"):
-            coordinator._import_stats(stats)
+        coordinator._import_stats(stats)
 
-        recorder_stats.async_import_statistics.assert_called_once()
+        recorder_stats.async_add_external_statistics.assert_called_once()
 
 
 class TestEntityId:
@@ -421,3 +513,10 @@ class TestEntityId:
         id2 = coordinator.entity_id
 
         assert id1 == id2
+
+    async def test_statistic_id_matches_entity_id(self, coordinator):
+        coordinator.client.username = "test@example.com"
+
+        # Same account hash and object id as the sensor, under the sjwater: domain.
+        assert coordinator.statistic_id == coordinator.entity_id.replace("sensor.sjwater_", "sjwater:")
+        assert coordinator.statistic_id == f"sjwater:{coordinator.account_id}_water_usage"

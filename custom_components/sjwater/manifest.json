@@ -9,5 +9,5 @@
   "iot_class": "cloud_polling",
   "quality_scale": "bronze",
   "requirements": ["python-dateutil==2.9.0.post0"],
-  "version": "0.0.2"
+  "version": "0.0.3"
 }

@@ -10,7 +10,7 @@ Custom Home Assistant integration for **SJ Water Company** (sjwaterhub.com). Fet
 - **Two sensors per account:**
   - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total, suitable for the HA Energy Dashboard
   - **Today's Water Usage** (`sensor.sjwater_<id>_todays_water_usage`) — Daily reset counter showing current day's consumption
-- **Energy Dashboard compatible** — Imports historical statistics so the water meter appears alongside gas/electric usage
+- **Energy Dashboard compatible** — Imports hourly usage into an external statistic (`sjwater:<id>_water_usage`) so the water meter appears alongside gas/electric usage, with readings landing in the hour they were actually consumed
 - **Persistent state** — Running sum survives HA restarts via `homeassistant.helpers.storage.Store`
 - **Session management** — Auto-authenticates, handles token rotation, and re-authenticates on session expiry
 - **Config flow** — UI-based setup via Settings → Devices & Services
@@ -59,27 +59,47 @@ The `<hash>` is the first 8 characters of SHA-256 of the username — a stable, 
 
 1. Go to **Settings → Dashboards → Energy**
 2. Under **Water consumption**, click **Add consumption**
-3. Select the **Water Meter Total** sensor
+3. Select **SJ Water Hub Water Usage** (statistic id `sjwater:<hash>_water_usage`) — *not* the `sensor.sjwater_…` entity
 4. The integration imports hourly statistics so historical data populates immediately
+
+The portal publishes readings several hours late. Writing them into the sensor entity's own
+statistics would place them in the hour they were *fetched*, and it also raced the recorder's
+hourly compile of that same series (`UNIQUE constraint failed: statistics.metadata_id,
+statistics.start_ts`, which stalls statistics for every entity in Home Assistant). The external
+statistic avoids both: the recorder never writes to it, and each hourly bucket is stored at the
+hour it was consumed.
+
+> **Upgrading from 0.0.2 or earlier:** open the Energy dashboard settings and swap the water
+> consumption source from the `sensor.sjwater_…` entity to the `sjwater:` statistic. The
+> integration re-imports the full history the portal returns (about two years), so the
+> external statistic is populated on the first poll.
 
 ## How It Works
 
 ### Authentication
 
-The integration authenticates against `sjwaterhub.com` using a two-step process:
+The integration authenticates against `sjwaterhub.com` using a three-step process:
 
 1. **GET** the login page to extract an anti-forgery token from a hidden `<input id="Token">` field
-2. **POST** credentials via the `VXengage_Login` action through the `RequestBroker` API
+2. **POST** that token to `/api/WebApi/CreateExceptionPermissions` (the portal rejects logins that skip this)
+3. **POST** credentials via the `VXengage_Login` action through the `RequestBroker` API
 
-After authentication, the session token is stored and refreshed on each API call. If the session expires, the integration automatically re-authenticates.
+The portal keeps no session cookie; the only cookies are load-balancer affinity cookies. Every
+`RequestBroker` response returns a fresh `Token`, which is stored and sent with the next call.
+If the session expires, the integration automatically re-authenticates.
 
 ### Data Fetching
 
 The coordinator polls `VXengage_GetHourlyGraph` every **1 hour** (`SCAN_INTERVAL = timedelta(hours=1)`). Each fetch returns:
 
-- Per-hour water consumption in gallons (delta values, not cumulative)
+- Per-hour water consumption in gallons (delta values, not cumulative). The meter reports in
+  1 ft³ increments, so values are multiples of ~7.48 gal.
 - Timestamps for each reading (local time, converted to UTC for HA)
-- Last-updated timestamp
+- Last-updated timestamp (`LastUpdated`)
+
+The portal pads the current day with `"0"` rows for hours it has not published yet. Any bucket
+starting at or after the current hour, or at or after `LastUpdated`, is ignored; those hours are
+picked up on a later poll once real readings exist.
 
 New readings are tracked via `_last_processed_start` to avoid duplicate imports. The running sum (`_current_sum`) is persisted to disk so it survives restarts.
 
