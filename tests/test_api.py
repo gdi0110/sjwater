@@ -326,16 +326,30 @@ class TestAsyncGetDataEdgeCases:
         with pytest.raises(Exception, match="API returned unsuccessful response"):
             await authenticated_client.async_get_data()
 
-    async def test_auto_login_when_no_token(self, api_client, mock_session, mock_get_factory, mock_post_factory):
+    async def test_auto_login_when_no_token(self, api_client, mock_session, mock_get_factory):
         mock_get_factory(text=load_fixture("login_page.html"))
-        mock_post_factory(data=load_json_fixture("login_success.json"))
-        mock_post_factory(data=load_json_fixture("hourly_graph_success.json"))
-
-        api_client._account_guid = "1234567890"
+        # CreateExceptionPermissions, VXengage_Login, VXengage_GetHourlyGraph
+        mock_session.post.side_effect = [
+            _make_async_resp(data={}),
+            _make_async_resp(data=load_json_fixture("login_success.json")),
+            _make_async_resp(data=load_json_fixture("hourly_graph_success.json")),
+        ]
 
         result = await api_client.async_get_data()
 
         assert len(result["history"]) > 0
+        assert api_client._account_guid == "1234567890"
+
+    async def test_failed_auto_login_raises_invalid_auth(self, api_client, mock_session, mock_get_factory, mock_post_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        mock_post_factory(data=load_json_fixture("login_failure.json"))
+
+        with pytest.raises(InvalidAuth):
+            await api_client.async_get_data()
+
+        # The page token of the rejected login must not be reused for data
+        # calls; the next poll has to log in again.
+        assert api_client._token is None
 
     async def test_custom_account_number(self, authenticated_client, mock_session, mock_post_factory):
         mock_post_factory(data=load_json_fixture("hourly_graph_success.json"))
@@ -371,8 +385,9 @@ class TestAsyncGetDataEdgeCases:
 
         result = await authenticated_client.async_get_data()
 
-        for entry in result["history"]:
-            assert isinstance(entry["start"], datetime)
+        # Readings without a usable timestamp are dropped rather than being
+        # booked at the current time.
+        assert result["history"] == []
 
     async def test_negative_gallons_clamped(self, authenticated_client, mock_session, mock_post_factory):
         mock_post_factory(data=load_json_fixture("hourly_graph_negative.json"))

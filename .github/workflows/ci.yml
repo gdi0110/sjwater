@@ -13,17 +13,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.14
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements_test.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install homeassistant pytest pytest-asyncio pytest-homeassistant-custom-component aiohttp python-dateutil
+          pip install -r requirements_test.txt
 
       - name: Run tests
         run: python -m pytest
