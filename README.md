@@ -8,9 +8,9 @@ Custom Home Assistant integration for **SJ Water Company** (sjwaterhub.com). Fet
 
 - **Hourly water usage** — Scrapes the SJ Water Hub portal API for per-hour consumption data (in gallons)
 - **Two sensors per account:**
-  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total, suitable for the HA Energy Dashboard
+  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total for dashboards and automations (use the `sjwater:` statistic, not this sensor, in the Energy Dashboard)
   - **Today's Water Usage** (`sensor.sjwater_<id>_todays_water_usage`) — Daily reset counter showing current day's consumption
-- **Energy Dashboard compatible** — Imports historical statistics so the water meter appears alongside gas/electric usage
+- **Energy Dashboard compatible** — Imports hourly usage into an external statistic (`sjwater:<id>_water_usage`) so the water meter appears alongside gas/electric usage, with readings landing in the hour they were actually consumed
 - **Persistent state** — Running sum survives HA restarts via `homeassistant.helpers.storage.Store`
 - **Session management** — Auto-authenticates, handles token rotation, and re-authenticates on session expiry
 - **Config flow** — UI-based setup via Settings → Devices & Services
@@ -66,27 +66,50 @@ The utility publishes hourly readings 6–24 hours late, so these routinely diff
 
 1. Go to **Settings → Dashboards → Energy**
 2. Under **Water consumption**, click **Add consumption**
-3. Select the **Water Meter Total** sensor
+3. Select **SJ Water Hub Water Usage** (statistic id `sjwater:<hash>_water_usage`) — *not* the `sensor.sjwater_…` entity
 4. The integration imports hourly statistics so historical data populates immediately
+
+The portal publishes readings several hours late. Writing them into the sensor entity's own
+statistics would place them in the hour they were *fetched*, and it also raced the recorder's
+hourly compile of that same series (`UNIQUE constraint failed: statistics.metadata_id,
+statistics.start_ts`, which stalls statistics for every entity in Home Assistant). The external
+statistic avoids both: the recorder never writes to it, and each hourly bucket is stored at the
+hour it was consumed.
+
+> **Upgrading from 0.0.2 or earlier:** open the Energy dashboard settings and swap the water
+> consumption source from the `sensor.sjwater_…` entity to the `sjwater:` statistic. On the
+> first poll after the upgrade the integration copies the history it had already imported
+> into the new statistic, so nothing is lost. Versions up to 0.0.2 could abort the recorder's
+> hourly statistics run for *every* entity (issues #10 and #12); hours that were dropped for
+> other sensors while those versions were installed cannot be recovered, and one last
+> `UNIQUE constraint failed` error may be logged at the top of the hour in which you upgrade.
 
 ## How It Works
 
 ### Authentication
 
-The integration authenticates against `sjwaterhub.com` using a two-step process:
+The integration authenticates against `sjwaterhub.com` using a three-step process:
 
 1. **GET** the login page to extract an anti-forgery token from a hidden `<input id="Token">` field
-2. **POST** credentials via the `VXengage_Login` action through the `RequestBroker` API
+2. **POST** that token to `/api/WebApi/CreateExceptionPermissions` (the portal rejects logins that skip this)
+3. **POST** credentials via the `VXengage_Login` action through the `RequestBroker` API
 
-After authentication, the session token is stored and refreshed on each API call. If the session expires, the integration automatically re-authenticates.
+The portal keeps no session cookie; the only cookies are load-balancer affinity cookies. Every
+`RequestBroker` response returns a fresh `Token`, which is stored and sent with the next call.
+If the session expires, the integration automatically re-authenticates.
 
 ### Data Fetching
 
 The coordinator polls `VXengage_GetHourlyGraph` every **1 hour** (`SCAN_INTERVAL = timedelta(hours=1)`). Each fetch returns:
 
-- Per-hour water consumption in gallons (delta values, not cumulative)
+- Per-hour water consumption in gallons (delta values, not cumulative). The meter reports in
+  1 ft³ increments, so values are multiples of ~7.48 gal.
 - Timestamps for each reading (local time, converted to UTC for HA)
-- Last-updated timestamp
+- Last-updated timestamp (`LastUpdated`)
+
+The portal pads the current day with `"0"` rows for hours it has not published yet. Any bucket
+starting at or after the current hour, or at or after `LastUpdated`, is ignored; those hours are
+picked up on a later poll once real readings exist.
 
 **Adaptive polling:** the API's `LastUpdated` marker only moves when the utility publishes new data. While the marker is unchanged between polls, the coordinator doubles its poll interval each cycle (up to **8 hours**); it resets to 1 hour as soon as new data appears. This avoids hammering the portal during the long stretches when nothing has changed.
 
@@ -155,14 +178,14 @@ This prevents the "midnight reset" artifact where a restart could re-import the 
 
 ### Statistics / Energy Dashboard not populating
 
-- Statistics are imported on each successful data fetch for new hourly readings only
+- Statistics are imported into the external statistic `sjwater:<hash>_water_usage` on each successful data fetch; look for it under **Developer Tools → Statistics**
 - Historical data is not backfilled beyond what the API returns
-- The Water Meter Total sensor uses monotonically increasing cumulative sums and is the recommended sensor for the Energy Dashboard
+- Select the `sjwater:` statistic (**SJ Water Hub Water Usage**) in the Energy Dashboard. The Water Meter Total sensor books usage at the time it was *fetched*, which can be up to a day after it was consumed
 - Today's Water Usage does not import separate statistics (daily-resetting sums are incompatible with the Energy Dashboard's change computation)
 
 ## Removal
 
-When you remove the integration via the UI, `async_remove_entry` cleans up the persisted state file from HA's storage. You should also manually delete any related recorder statistics if desired.
+When you remove the integration via the UI, `async_remove_entry` cleans up the persisted state file from HA's storage. The imported `sjwater:<hash>_water_usage` statistic is kept; delete it under **Developer Tools → Statistics** if you no longer want the history.
 
 ## License
 
