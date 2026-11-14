@@ -19,6 +19,23 @@ def _account_id(username: str) -> str:
     """Return a short stable non-PII identifier derived from the username."""
     return hashlib.sha256(username.encode()).hexdigest()[:8]
 
+
+def _freshness_attributes(coordinator) -> dict:
+    """Return poll/data freshness attributes shared by all sensors.
+
+    The utility publishes readings 6-24h late, so the time we last polled the
+    portal (``last_polled_at``) routinely differs from the timestamp of the
+    newest reading the portal actually had (``latest_data_point_at``). On a
+    failed poll the coordinator retains the previous data, so
+    ``last_polled_at`` reflects the last *successful* poll.
+    """
+    if coordinator.data is None:
+        return {}
+    return {
+        "last_polled_at": coordinator.data.get("polled_at"),
+        "latest_data_point_at": coordinator.data.get("timestamp"),
+    }
+
 async def async_setup_entry(hass, entry, async_add_entities):
     """Set up the sensor platform from a config entry."""
     coordinator = entry.runtime_data
@@ -69,12 +86,8 @@ class SJWaterHubSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        """Include the scraped timestamp in the standard state machine as well."""
-        if self.coordinator.data is not None:
-            return {
-                "recorded_at": self.coordinator.data.get("timestamp")
-            }
-        return {}
+        """Include poll/data freshness timestamps in the state machine."""
+        return _freshness_attributes(self.coordinator)
 
 
 class SJWaterHubDailySensor(CoordinatorEntity, SensorEntity):
@@ -114,6 +127,11 @@ class SJWaterHubDailySensor(CoordinatorEntity, SensorEntity):
         if self.coordinator.data is not None:
             return max(0.0, self.coordinator.data.get("today_sum", 0.0))
         return None
+
+    @property
+    def extra_state_attributes(self):
+        """Include poll/data freshness timestamps in the state machine."""
+        return _freshness_attributes(self.coordinator)
 
     @property
     def last_reset(self):

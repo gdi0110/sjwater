@@ -65,6 +65,8 @@ class TestAsyncUpdateData:
         assert result["current_sum"] == 4.0
         assert "today_sum" in result
         assert "timestamp" in result
+        assert "polled_at" in result
+        assert result["timestamp"] == now
         mock_store.async_save.assert_called_once()
         mock_import.assert_called_once()
 
@@ -106,6 +108,10 @@ class TestAsyncUpdateData:
 
         assert result["current_sum"] == 0.0
         assert result["today_sum"] == 0.0
+        # No readings returned -> no latest data point, but the poll time is
+        # still recorded so entities can show freshness.
+        assert result["timestamp"] is None
+        assert result["polled_at"] is not None
         mock_store.async_save.assert_not_called()
         mock_import.assert_not_called()
 

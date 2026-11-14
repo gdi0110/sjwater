@@ -88,13 +88,29 @@ class TestSJWaterHubSensor:
         assert info["model"] == "Scraped Hub"
 
     async def test_extra_state_attributes_with_data(self, total_sensor, mock_coordinator):
-        mock_coordinator.data = {"current_sum": 100.0, "timestamp": "2024-06-06T12:00:00"}
+        mock_coordinator.data = {
+            "current_sum": 100.0,
+            "timestamp": "2024-06-06T12:00:00",
+            "polled_at": "2024-06-06T18:00:00",
+        }
         attrs = total_sensor.extra_state_attributes
-        assert attrs.get("recorded_at") == "2024-06-06T12:00:00"
+        assert attrs.get("latest_data_point_at") == "2024-06-06T12:00:00"
+        assert attrs.get("last_polled_at") == "2024-06-06T18:00:00"
+        assert "recorded_at" not in attrs
 
     async def test_extra_state_attributes_empty_when_no_data(self, total_sensor, mock_coordinator):
         mock_coordinator.data = None
         assert total_sensor.extra_state_attributes == {}
+
+    async def test_extra_state_attributes_none_latest_when_no_readings(self, total_sensor, mock_coordinator):
+        mock_coordinator.data = {
+            "current_sum": 100.0,
+            "timestamp": None,
+            "polled_at": "2024-06-06T18:00:00",
+        }
+        attrs = total_sensor.extra_state_attributes
+        assert attrs.get("latest_data_point_at") is None
+        assert attrs.get("last_polled_at") == "2024-06-06T18:00:00"
 
 
 class TestSJWaterHubDailySensor:
@@ -129,6 +145,30 @@ class TestSJWaterHubDailySensor:
 
     async def test_device_info_matches_total_sensor(self, daily_sensor, total_sensor):
         assert daily_sensor.device_info == total_sensor.device_info
+
+    async def test_extra_state_attributes_with_data(self, daily_sensor, mock_coordinator):
+        mock_coordinator.data = {
+            "current_sum": 150.5,
+            "today_sum": 5.5,
+            "timestamp": "2024-06-06T12:00:00",
+            "polled_at": "2024-06-06T18:00:00",
+        }
+        attrs = daily_sensor.extra_state_attributes
+        assert attrs.get("latest_data_point_at") == "2024-06-06T12:00:00"
+        assert attrs.get("last_polled_at") == "2024-06-06T18:00:00"
+
+    async def test_extra_state_attributes_empty_when_no_data(self, daily_sensor, mock_coordinator):
+        mock_coordinator.data = None
+        assert daily_sensor.extra_state_attributes == {}
+
+    async def test_extra_state_attributes_match_total_sensor(self, daily_sensor, total_sensor, mock_coordinator):
+        mock_coordinator.data = {
+            "current_sum": 150.5,
+            "today_sum": 5.5,
+            "timestamp": "2024-06-06T12:00:00",
+            "polled_at": "2024-06-06T18:00:00",
+        }
+        assert daily_sensor.extra_state_attributes == total_sensor.extra_state_attributes
 
     async def test_last_reset_returns_midnight(self, daily_sensor):
         with patch("custom_components.sjwater.sensor.dt_util.now") as mock_now:
