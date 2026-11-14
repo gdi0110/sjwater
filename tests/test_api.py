@@ -97,6 +97,17 @@ class TestAsyncLogin:
         assert "CreateExceptionPermissions" in urls[0]
         assert "RequestBroker" in urls[1]
 
+    async def test_raises_on_exception_permissions_failure(self, api_client, mock_session, mock_get_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        resp = _make_async_resp(status=500)
+        resp.raise_for_status.side_effect = aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=500, message="Internal Server Error"
+        )
+        mock_session.post.return_value = resp
+
+        with pytest.raises(aiohttp.ClientResponseError):
+            await api_client.async_login()
+
 
 class TestAsyncVerifyCredentials:
     async def test_success(self, api_client, mock_session, mock_get_factory, mock_post_factory):
@@ -128,6 +139,17 @@ class TestAsyncVerifyCredentials:
         mock_session.get.return_value = resp
 
         with pytest.raises(CannotConnect, match="Unexpected error"):
+            await api_client.async_verify_credentials()
+
+    async def test_raises_cannot_connect_on_exception_permissions_failure(self, api_client, mock_session, mock_get_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        resp = _make_async_resp(status=500)
+        resp.raise_for_status.side_effect = aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=500, message="Internal Server Error"
+        )
+        mock_session.post.return_value = resp
+
+        with pytest.raises(CannotConnect, match="Cannot reach SJ Water Hub"):
             await api_client.async_verify_credentials()
 
 
