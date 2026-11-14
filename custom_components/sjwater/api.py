@@ -198,7 +198,10 @@ class SJWaterHubApiClient:
 
         # Ensure we are logged in first
         if not self._token:
-            await self.async_login()
+            if not await self.async_login():
+                # Don't carry the unauthenticated page token into data calls.
+                self._token = None
+                raise InvalidAuth("Login to SJ Water Hub failed")
 
         # Try to use configured account number, or fallback to auto-detected one
         account = account_number or self._account_guid
@@ -220,7 +223,8 @@ class SJWaterHubApiClient:
             _LOGGER.debug("Session expired. Re-authenticating...")
             login_success = await self.async_login()
             if not login_success:
-                raise Exception("Re-authentication failed")
+                self._token = None
+                raise InvalidAuth("Re-authentication failed")
             data = await self._post_request("VXengage_GetHourlyGraph", "UnderstandUsage", data_additions)
 
         # Extract the VXengage_GetHourlyGraph inner response
@@ -228,7 +232,7 @@ class SJWaterHubApiClient:
 
         if not graph_data or not graph_data.get("Success"):
             _LOGGER.error("Failed to fetch hourly graph data")
-            raise Exception("API returned unsuccessful response for hourly graph.")
+            raise CannotConnect("API returned unsuccessful response for hourly graph.")
 
         # Update our token if it revolved
         if data.get("Token"):
@@ -264,11 +268,14 @@ class SJWaterHubApiClient:
                             else:
                                 label_str = str(label_val)
 
+                            # A reading without a usable timestamp cannot be
+                            # placed in an hourly bucket. Skip it: booking it
+                            # at "now" would credit usage to the wrong hour.
                             try:
                                 dt_naive = dt_parse(label_str)
                             except Exception as parse_e:
-                                _LOGGER.debug("Failed to parse label '%s': %s", label_str, parse_e)
-                                dt_naive = dt_util.now()
+                                _LOGGER.debug("Skipping reading with unparseable label '%s': %s", label_str, parse_e)
+                                continue
 
                             # The SJ Water company data is in local time, not UTC.
                             # If we inject local time as UTC, Home Assistant offsets it by the
@@ -299,13 +306,11 @@ class SJWaterHubApiClient:
                         # The label for this point
                         label_str = labels[index] if index < len(labels) else ""
                         _LOGGER.debug("Found latest graph data: %s at %s", parsed_gallons, label_str)
-                        # Also set the timestamp from this reading's entry in parsed_history
-                        # (find the matching entry by index/value)
-                        for h in reversed(parsed_history):
-                            if abs(h["state"] - parsed_gallons) < 0.001:
-                                parsed_timestamp = h["start"]
-                                break
                         break
+
+                # Timestamp of the newest reading that could be placed in time.
+                if parsed_history:
+                    parsed_timestamp = parsed_history[-1]["start"]
 
             except Exception as e:
                 _LOGGER.error("Error parsing graph data sets: %s", e)

@@ -120,6 +120,9 @@ class TestAsyncSetupEntry:
             with pytest.raises(Exception, match="Refresh failed"):
                 await async_setup_entry(hass, entry)
 
+        # Platforms must not be set up when the first refresh fails.
+        hass.config_entries.async_forward_entry_setups.assert_not_called()
+
 
 class TestAsyncUnloadEntry:
     async def test_unloads_sensor_platform(self):

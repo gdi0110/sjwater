@@ -4,9 +4,10 @@
   "codeowners": ["@gdi0110"],
   "config_flow": true,
   "dependencies": ["recorder"],
-  "documentation": "https://www.home-assistant.io/integrations/sjwater",
+  "documentation": "https://github.com/gdi0110/sjwater",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/gdi0110/sjwater/issues",
   "quality_scale": "bronze",
   "requirements": ["python-dateutil==2.9.0.post0"],
   "version": "0.0.3"
