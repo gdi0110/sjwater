@@ -8,7 +8,7 @@ Custom Home Assistant integration for **SJ Water Company** (sjwaterhub.com). Fet
 
 - **Hourly water usage** — Scrapes the SJ Water Hub portal API for per-hour consumption data (in gallons)
 - **Two sensors per account:**
-  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total for dashboards and automations (use the `sjwater:` statistic, not this sensor, in the Energy Dashboard)
+  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total for dashboards and automations (for the Energy Dashboard, select the **SJ Water Hub Water Usage** statistic instead; see [Energy Dashboard Setup](#energy-dashboard-setup))
   - **Today's Water Usage** (`sensor.sjwater_<id>_todays_water_usage`) — Daily reset counter showing current day's consumption
 - **Energy Dashboard compatible** — Imports hourly usage into an external statistic (`sjwater:<id>_water_usage`) so the water meter appears alongside gas/electric usage, with readings landing in the hour they were actually consumed
 - **Persistent state** — Running sum survives HA restarts via `homeassistant.helpers.storage.Store`
@@ -66,8 +66,18 @@ The utility publishes hourly readings 6–24 hours late, so these routinely diff
 
 1. Go to **Settings → Dashboards → Energy**
 2. Under **Water consumption**, click **Add consumption**
-3. Select **SJ Water Hub Water Usage** (statistic id `sjwater:<hash>_water_usage`) — *not* the `sensor.sjwater_…` entity
-4. The integration imports hourly statistics so historical data populates immediately
+3. In the list, select **SJ Water Hub Water Usage**
+4. Save. Historical data populates immediately because the integration imports hourly statistics
+
+The integration provides three water items, and only one belongs in the Energy dashboard:
+
+| Name shown in the list | ID | Use in Energy dashboard? |
+|------------------------|----|--------------------------|
+| **SJ Water Hub Water Usage** | `sjwater:<hash>_water_usage` (statistic) | **Yes, select this one** |
+| SJ Water Hub Water Meter Total | `sensor.sjwater_<hash>_water_usage` (sensor) | No |
+| SJ Water Hub Today's Water Usage | `sensor.sjwater_<hash>_todays_water_usage` (sensor) | No |
+
+The two `_water_usage` IDs differ only in their prefix: the correct one starts with `sjwater:` (a colon), the wrong one with `sensor.`. To find your `<hash>`, open **Developer Tools → Statistics** and search for `sjwater:`.
 
 The portal publishes readings several hours late. Writing them into the sensor entity's own
 statistics would place them in the hour they were *fetched*, and it also raced the recorder's
@@ -76,8 +86,9 @@ statistics.start_ts`, which stalls statistics for every entity in Home Assistant
 statistic avoids both: the recorder never writes to it, and each hourly bucket is stored at the
 hour it was consumed.
 
-> **Upgrading from 0.0.2 or earlier:** open the Energy dashboard settings and swap the water
-> consumption source from the `sensor.sjwater_…` entity to the `sjwater:` statistic. On the
+> **Upgrading from 0.0.2 or earlier:** open the Energy dashboard settings, remove
+> **SJ Water Hub Water Meter Total** (`sensor.sjwater_<hash>_water_usage`) from Water consumption,
+> and add **SJ Water Hub Water Usage** (`sjwater:<hash>_water_usage`) instead. On the
 > first poll after the upgrade the integration copies the history it had already imported
 > into the new statistic, so nothing is lost. Versions up to 0.0.2 could abort the recorder's
 > hourly statistics run for *every* entity (issues #10 and #12); hours that were dropped for
