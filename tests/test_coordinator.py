@@ -154,6 +154,7 @@ class TestAsyncUpdateData:
         mock_store.async_save.assert_called_once_with({
             "current_sum": 8.0,
             "last_processed_start": int(history[0]["start"].timestamp()),
+            "external_stats_backfilled": True,
         })
 
     async def test_propagates_api_error(self, coordinator, mock_store):
@@ -310,6 +311,7 @@ class TestFinalizationWindow:
         mock_store.async_save.assert_called_once_with({
             "current_sum": 4.0,
             "last_processed_start": int(old.timestamp()),
+            "external_stats_backfilled": True,
         })
 
     async def test_reported_sum_never_decreases(self, coordinator, mock_store):
@@ -459,7 +461,7 @@ class TestStatsImportDedup:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.5,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
@@ -486,13 +488,13 @@ class TestStatsImportDedup:
             {
                 "gallons": 2.5,
                 "timestamp": now,
-                "last_updated": "2024-06-06T12:00:00",
+                "last_updated": PUBLISHED_EVERYTHING,
                 "history": history,
             },
             {
                 "gallons": 3.0,
                 "timestamp": now,
-                "last_updated": "2024-06-06T13:00:00",
+                "last_updated": "2099-01-02T00:00:00+00:00",
                 "history": revised_history,
             },
         ])):
@@ -515,7 +517,7 @@ class TestStatsImportDedup:
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
             "gallons": 2.5,
             "timestamp": now,
-            "last_updated": "2024-06-06T12:00:00",
+            "last_updated": PUBLISHED_EVERYTHING,
             "history": history,
         })):
             with patch.object(coordinator, "_import_stats", return_value=False) as mock_import:
@@ -582,6 +584,150 @@ class TestAdaptPollInterval:
 
                 await coordinator._async_update_data()
                 assert coordinator.update_interval == SCAN_INTERVAL * 2
+
+
+class TestExternalStatsBackfill:
+    """Upgrade path from <= 0.0.2, which imported into the entity's series."""
+
+    @staticmethod
+    def _history(now):
+        base = (now - timedelta(hours=100)).replace(minute=0, second=0, microsecond=0)
+        return base, [
+            {"start": base, "state": "1.0"},
+            {"start": base + timedelta(hours=1), "state": "2.0"},
+            {"start": base + timedelta(hours=2), "state": "3.0"},
+            {"start": base + timedelta(hours=3), "state": "4.0"},
+        ]
+
+    async def test_legacy_state_backfills_finalized_history(self, coordinator, mock_store):
+        now = dt_util.utcnow()
+        base, history = self._history(now)
+        # Legacy store: first three hours already folded into the sum.
+        mock_store.async_load.return_value = {
+            "current_sum": 6.0,
+            "last_processed_start": int((base + timedelta(hours=2)).timestamp()),
+        }
+        await coordinator.async_initialize()
+        assert coordinator._needs_backfill is True
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(history, now)),
+        ):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    result = await coordinator._async_update_data()
+
+        rows = mock_import.call_args[0][0]
+        assert [r["start"] for r in rows] == [h["start"] for h in history]
+        assert [r["state"] for r in rows] == [1.0, 2.0, 3.0, 4.0]
+        # Sums are continuous and end on the persisted running total.
+        assert [r["sum"] for r in rows] == [1.0, 3.0, 6.0, 10.0]
+        assert result["current_sum"] == 10.0
+        assert coordinator._needs_backfill is False
+        mock_store.async_save.assert_called_once_with({
+            "current_sum": 10.0,
+            "last_processed_start": int((base + timedelta(hours=3)).timestamp()),
+            "external_stats_backfilled": True,
+        })
+
+    async def test_backfill_keeps_sum_continuous_when_history_exceeds_sum(
+        self, coordinator, mock_store
+    ):
+        now = dt_util.utcnow()
+        base, history = self._history(now)
+        # Legacy sum lower than the portal's history (earlier versions could
+        # drop readings): rows must still line up with the persisted sum.
+        mock_store.async_load.return_value = {
+            "current_sum": 5.0,
+            "last_processed_start": int((base + timedelta(hours=3)).timestamp()),
+        }
+        await coordinator.async_initialize()
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(history, now)),
+        ):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+
+        rows = mock_import.call_args[0][0]
+        assert [r["sum"] for r in rows] == [-4.0, -2.0, 1.0, 5.0]
+        assert coordinator._current_sum == 5.0
+        mock_store.async_save.assert_called_once()
+
+    async def test_backfill_retried_when_import_fails(self, coordinator, mock_store):
+        now = dt_util.utcnow()
+        base, history = self._history(now)
+        watermark = int((base + timedelta(hours=2)).timestamp())
+        mock_store.async_load.return_value = {
+            "current_sum": 6.0,
+            "last_processed_start": watermark,
+        }
+        await coordinator.async_initialize()
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(history, now)),
+        ):
+            with patch.object(coordinator, "_import_stats", return_value=False) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+                    await coordinator._async_update_data()
+
+        # Nothing persisted, watermark not advanced, full batch retried.
+        assert mock_import.call_count == 2
+        assert len(mock_import.call_args[0][0]) == 4
+        assert coordinator._needs_backfill is True
+        assert coordinator._last_processed_start == watermark
+        assert coordinator._current_sum == 6.0
+        mock_store.async_save.assert_not_called()
+
+    async def test_migrated_state_does_not_backfill(self, coordinator, mock_store):
+        now = dt_util.utcnow()
+        base, history = self._history(now)
+        mock_store.async_load.return_value = {
+            "current_sum": 6.0,
+            "last_processed_start": int((base + timedelta(hours=2)).timestamp()),
+            "external_stats_backfilled": True,
+        }
+        await coordinator.async_initialize()
+        assert coordinator._needs_backfill is False
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(history, now)),
+        ):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+
+        rows = mock_import.call_args[0][0]
+        assert [r["sum"] for r in rows] == [10.0]
+
+    async def test_fresh_install_needs_no_backfill(self, coordinator, mock_store):
+        mock_store.async_load.return_value = None
+        await coordinator.async_initialize()
+        assert coordinator._needs_backfill is False
+
+    async def test_unsorted_history_is_processed_in_order(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+        now = dt_util.utcnow()
+        _, history = self._history(now)
+
+        with patch.object(
+            coordinator.client, "async_get_data",
+            new=AsyncMock(return_value=_api_data(list(reversed(history)), now)),
+        ):
+            with patch.object(coordinator, "_import_stats", return_value=True) as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    await coordinator._async_update_data()
+
+        rows = mock_import.call_args[0][0]
+        assert [r["sum"] for r in rows] == [1.0, 3.0, 6.0, 10.0]
+        assert coordinator._last_processed_start == int(history[-1]["start"].timestamp())
 
 
 class TestImportStats:

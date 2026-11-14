@@ -45,6 +45,11 @@ FINALIZATION_LAG = timedelta(hours=48)
 # which aborted statistics for *every* entity in Home Assistant (issue #10).
 STATISTIC_ID_SUFFIX = "water_usage"
 
+# Store flag: the finalized history has been written to the external statistic.
+# Absent in state persisted by versions <= 0.0.2, which imported into the
+# sensor entity's series instead.
+STORE_KEY_EXTERNAL_STATS = "external_stats_backfilled"
+
 
 class SJWaterHubCoordinator(DataUpdateCoordinator):
     """Coordinator for SJ Water Hub data fetching and state persistence."""
@@ -82,6 +87,10 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         self._last_reported_sum: float | None = None
         self._last_import_signature: list | None = None
         self._last_server_update: str | None = None
+        # True when state written by a version that imported into the sensor
+        # entity's own statistics was restored: the already-finalized history
+        # must be copied once into the external statistic.
+        self._needs_backfill = False
         self._initialized = False
         _LOGGER.debug("%s: Coordinator created", DOMAIN)
 
@@ -94,6 +103,10 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         if stored:
             self._current_sum = stored.get("current_sum")
             self._last_processed_start = stored.get("last_processed_start")
+            self._needs_backfill = (
+                self._last_processed_start is not None
+                and not stored.get(STORE_KEY_EXTERNAL_STATS)
+            )
             _LOGGER.debug(
                 "Restored from store: current_sum=%s, last_processed_start=%s",
                 self._current_sum,
@@ -115,10 +128,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 clamped,
             )
             self._last_processed_start = clamped
-            await self._store.async_save({
-                "current_sum": self._current_sum,
-                "last_processed_start": self._last_processed_start,
-            })
+            await self._async_save_state()
 
         _LOGGER.debug(
             "State recovery complete: sum=%s, last_processed=%s",
@@ -126,6 +136,14 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             self._last_processed_start,
         )
         self._initialized = True
+
+    async def _async_save_state(self) -> None:
+        """Persist the finalized running sum and watermark."""
+        await self._store.async_save({
+            "current_sum": self._current_sum,
+            "last_processed_start": self._last_processed_start,
+            STORE_KEY_EXTERNAL_STATS: not self._needs_backfill,
+        })
 
     @property
     def account_id(self) -> str:
@@ -194,14 +212,14 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             # the import cutoff (the in-progress hour, and anything the portal
             # has not published yet per LastUpdated) are "0" placeholders the
             # API pads the current day with and must never be imported.
-            for entry in history:
-                entry_start_dt = entry.get("start")
+            already_finalized: list[tuple[datetime, float]] = []
+            for entry in sorted(
+                (e for e in history if isinstance(e.get("start"), datetime)),
+                key=lambda e: e["start"],
+            ):
+                entry_start_dt = entry["start"]
                 entry_state = max(0.0, float(entry.get("state", 0.0)))
-
-                if isinstance(entry_start_dt, datetime):
-                    entry_ts = int(entry_start_dt.timestamp())
-                else:
-                    continue
+                entry_ts = int(entry_start_dt.timestamp())
 
                 if entry_ts >= import_cutoff_ts:
                     continue
@@ -212,6 +230,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
 
                 # Skip already-finalized readings
                 if self._last_processed_start is not None and entry_ts <= self._last_processed_start:
+                    already_finalized.append((entry_start_dt, entry_state))
                     continue
 
                 new_sum += entry_state
@@ -234,18 +253,32 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                     entry_ts, entry_state, new_sum,
                 )
 
-            # Persist state (finalized buckets only)
-            if last_start_ts is not None:
-                self._current_sum = new_sum
-                self._last_processed_start = last_start_ts
-                await self._store.async_save({
-                    "current_sum": self._current_sum,
-                    "last_processed_start": self._last_processed_start,
-                })
-                _LOGGER.debug("Persisted: sum=%s, last_start=%s", new_sum, last_start_ts)
+            # One-time migration from <= 0.0.2: those versions wrote the
+            # finalized history into the sensor entity's series, so the
+            # external statistic would otherwise start at the watermark and
+            # lose everything before it. Rebuild those rows backwards from the
+            # persisted running sum so they line up with the rows that follow.
+            if self._needs_backfill:
+                backfill: list[dict] = []
+                running = self._current_sum or 0.0
+                for entry_start_dt, entry_state in reversed(already_finalized):
+                    backfill.append({
+                        "start": entry_start_dt.astimezone(timezone.utc).replace(
+                            minute=0, second=0, microsecond=0
+                        ),
+                        "state": entry_state,
+                        "sum": running,
+                    })
+                    running -= entry_state
+                backfill.reverse()
+                total_stats = backfill + total_stats
+                _LOGGER.info(
+                    "Copying %d previously imported hourly readings into %s",
+                    len(backfill), self.statistic_id,
+                )
 
             # Rebuild the provisional window on top of the finalized sum every
-            # poll. async_import_statistics upserts by hour start, so rows for
+            # poll. async_add_external_statistics upserts by hour start, so rows for
             # hours whose readings arrived or were revised since the last poll
             # overwrite the stale placeholder rows in the statistics table.
             provisional_sum = new_sum
@@ -273,13 +306,29 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             # batch. Skip the recorder upsert when nothing changed; only
             # record the signature after a successful import so a failed
             # import is retried on the next poll.
+            imported = True
             if total_stats:
                 signature = [
                     (row["start"], row["state"], row["sum"]) for row in total_stats
                 ]
                 if signature != self._last_import_signature:
-                    if self._import_stats(total_stats):
+                    imported = self._import_stats(total_stats)
+                    if imported:
                         self._last_import_signature = signature
+
+            # Persist state (finalized buckets only), and only once the rows
+            # were handed to the recorder: advancing the watermark past rows
+            # that were never imported would leave a permanent hole.
+            if imported and (last_start_ts is not None or self._needs_backfill):
+                self._current_sum = new_sum
+                if last_start_ts is not None:
+                    self._last_processed_start = last_start_ts
+                self._needs_backfill = False
+                await self._async_save_state()
+                _LOGGER.debug(
+                    "Persisted: sum=%s, last_start=%s",
+                    self._current_sum, self._last_processed_start,
+                )
 
             # Never report a lower total than a previous poll: a downward
             # provisional revision would otherwise read as a meter reset to
@@ -401,6 +450,8 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 "Imported %d stats (last sum=%.1f)", len(stats), stats[-1]["sum"]
             )
             return True
-        except Exception as exc:
-            _LOGGER.debug("Failed to import statistics: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - never let stats break the poll
+            _LOGGER.warning(
+                "Failed to import statistics into %s: %s", self.statistic_id, exc
+            )
             return False

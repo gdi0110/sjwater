@@ -8,7 +8,7 @@ Custom Home Assistant integration for **SJ Water Company** (sjwaterhub.com). Fet
 
 - **Hourly water usage** — Scrapes the SJ Water Hub portal API for per-hour consumption data (in gallons)
 - **Two sensors per account:**
-  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total, suitable for the HA Energy Dashboard
+  - **Water Meter Total** (`sensor.sjwater_<id>_water_usage`) — Monotonically increasing total for dashboards and automations (use the `sjwater:` statistic, not this sensor, in the Energy Dashboard)
   - **Today's Water Usage** (`sensor.sjwater_<id>_todays_water_usage`) — Daily reset counter showing current day's consumption
 - **Energy Dashboard compatible** — Imports hourly usage into an external statistic (`sjwater:<id>_water_usage`) so the water meter appears alongside gas/electric usage, with readings landing in the hour they were actually consumed
 - **Persistent state** — Running sum survives HA restarts via `homeassistant.helpers.storage.Store`
@@ -77,9 +77,12 @@ statistic avoids both: the recorder never writes to it, and each hourly bucket i
 hour it was consumed.
 
 > **Upgrading from 0.0.2 or earlier:** open the Energy dashboard settings and swap the water
-> consumption source from the `sensor.sjwater_…` entity to the `sjwater:` statistic. The
-> integration re-imports the full history the portal returns (about two years), so the
-> external statistic is populated on the first poll.
+> consumption source from the `sensor.sjwater_…` entity to the `sjwater:` statistic. On the
+> first poll after the upgrade the integration copies the history it had already imported
+> into the new statistic, so nothing is lost. Versions up to 0.0.2 could abort the recorder's
+> hourly statistics run for *every* entity (issues #10 and #12); hours that were dropped for
+> other sensors while those versions were installed cannot be recovered, and one last
+> `UNIQUE constraint failed` error may be logged at the top of the hour in which you upgrade.
 
 ## How It Works
 
@@ -175,14 +178,14 @@ This prevents the "midnight reset" artifact where a restart could re-import the 
 
 ### Statistics / Energy Dashboard not populating
 
-- Statistics are imported on each successful data fetch for new hourly readings only
+- Statistics are imported into the external statistic `sjwater:<hash>_water_usage` on each successful data fetch; look for it under **Developer Tools → Statistics**
 - Historical data is not backfilled beyond what the API returns
-- The Water Meter Total sensor uses monotonically increasing cumulative sums and is the recommended sensor for the Energy Dashboard
+- Select the `sjwater:` statistic (**SJ Water Hub Water Usage**) in the Energy Dashboard. The Water Meter Total sensor books usage at the time it was *fetched*, which can be up to a day after it was consumed
 - Today's Water Usage does not import separate statistics (daily-resetting sums are incompatible with the Energy Dashboard's change computation)
 
 ## Removal
 
-When you remove the integration via the UI, `async_remove_entry` cleans up the persisted state file from HA's storage. You should also manually delete any related recorder statistics if desired.
+When you remove the integration via the UI, `async_remove_entry` cleans up the persisted state file from HA's storage. The imported `sjwater:<hash>_water_usage` statistic is kept; delete it under **Developer Tools → Statistics** if you no longer want the history.
 
 ## License
 
