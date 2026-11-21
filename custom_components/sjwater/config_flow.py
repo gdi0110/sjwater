@@ -5,7 +5,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import SJWaterHubApiClient, InvalidAuth, CannotConnect
-from .const import DOMAIN, CONF_USERNAME, CONF_PASSWORD
+from .const import DOMAIN, CONF_USERNAME, CONF_PASSWORD, CONF_PRICE_PER_GALLON
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -28,6 +28,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for SJ Water Hub."""
 
     VERSION = 1
+
+    @staticmethod
+    def async_get_options_flow(config_entry):
+        """Return the options flow (price per gallon for the cost statistic)."""
+        return OptionsFlow()
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step."""
@@ -52,3 +57,26 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
+
+
+class OptionsFlow(config_entries.OptionsFlowWithReload):
+    """Set the price per gallon used for the water cost statistic."""
+
+    async def async_step_init(self, user_input=None):
+        """Show or save the price. Leave it empty to turn cost tracking off."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_PRICE_PER_GALLON,
+                    description={
+                        "suggested_value": self.config_entry.options.get(
+                            CONF_PRICE_PER_GALLON
+                        )
+                    },
+                ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

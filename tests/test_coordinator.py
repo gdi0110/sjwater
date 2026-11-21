@@ -816,3 +816,174 @@ class TestEntityId:
         # Same account hash and object id as the sensor, under the sjwater: domain.
         assert coordinator.statistic_id == coordinator.entity_id.replace("sensor.sjwater_", "sjwater:")
         assert coordinator.statistic_id == f"sjwater:{coordinator.account_id}_water_usage"
+
+
+def _fake_recorder(usage_rows=None, last_sums=None, fail_cost=False):
+    """Install fake recorder modules; return the external-statistics mock."""
+    import sys, types
+
+    recorder_models = types.ModuleType("homeassistant.components.recorder.models")
+    recorder_models.StatisticMeanType = MagicMock()
+    recorder_models.StatisticMeanType.NONE = "NONE"
+
+    def add_external(hass, metadata, rows):
+        if fail_cost and metadata["statistic_id"].endswith("_water_cost"):
+            raise Exception("Import failed")
+
+    recorder_stats = types.ModuleType("homeassistant.components.recorder.statistics")
+    recorder_stats.async_add_external_statistics = MagicMock(side_effect=add_external)
+    recorder_stats.statistics_during_period = MagicMock(
+        side_effect=lambda hass, start, end, ids, *a: {
+            stat_id: list(usage_rows or []) for stat_id in ids
+        }
+    )
+    recorder_stats.get_last_statistics = MagicMock(
+        side_effect=lambda hass, n, stat_id, *a: (
+            {stat_id: [{"sum": last_sums[stat_id]}]}
+            if last_sums and stat_id in last_sums else {}
+        )
+    )
+
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock(side_effect=lambda f, *a: f(*a))
+    import homeassistant.components.recorder as recorder_pkg
+    sys.modules["homeassistant.components.recorder.models"] = recorder_models
+    sys.modules["homeassistant.components.recorder.statistics"] = recorder_stats
+    return recorder_stats, patch.object(
+        recorder_pkg, "get_instance", return_value=instance, create=True
+    )
+
+
+def _calls_for(mock_import, stat_id):
+    return [c[0][2] for c in mock_import.call_args_list if c[0][1]["statistic_id"] == stat_id]
+
+
+class TestWaterCost:
+    STATS = [
+        {"start": datetime(2024, 6, 6, 2, 0, 0, tzinfo=timezone.utc), "state": 10.0, "sum": 110.0},
+        {"start": datetime(2024, 6, 6, 3, 0, 0, tzinfo=timezone.utc), "state": 20.0, "sum": 130.0},
+    ]
+
+    async def test_no_cost_without_price(self, coordinator):
+        recorder_stats, _ = _fake_recorder()
+        coordinator._import_stats(self.STATS)
+        assert _calls_for(recorder_stats.async_add_external_statistics, coordinator.cost_statistic_id) == []
+
+    async def test_cost_rows_follow_usage_rows(self, coordinator):
+        recorder_stats, _ = _fake_recorder()
+        coordinator._cost_price = 0.01
+        coordinator._cost_anchor_usage = 100.0
+        coordinator._cost_anchor_cost = 5.0
+
+        assert coordinator._import_stats(self.STATS) is True
+
+        mock_import = recorder_stats.async_add_external_statistics
+        (rows,) = _calls_for(mock_import, coordinator.cost_statistic_id)
+        assert [r["start"] for r in rows] == [r["start"] for r in self.STATS]
+        assert [r["state"] for r in rows] == pytest.approx([0.1, 0.2])
+        assert [r["sum"] for r in rows] == pytest.approx([5.1, 5.3])
+        metadata = next(
+            c[0][1] for c in mock_import.call_args_list
+            if c[0][1]["statistic_id"] == coordinator.cost_statistic_id
+        )
+        assert metadata["statistic_id"].startswith("sjwater:")
+        assert metadata["has_sum"] is True
+        assert metadata["unit_of_measurement"] is None
+
+    async def test_cost_failure_does_not_fail_usage_import(self, coordinator):
+        _fake_recorder(fail_cost=True)
+        coordinator._cost_price = 0.01
+        assert coordinator._import_stats(self.STATS) is True
+
+    async def test_first_price_prices_existing_history(self, coordinator, mock_store):
+        usage = [
+            {"start": r["start"].timestamp(), "state": r["state"], "sum": r["sum"]}
+            for r in self.STATS
+        ]
+        recorder_stats, get_instance = _fake_recorder(usage_rows=usage)
+        coordinator._price = 0.01
+
+        with get_instance:
+            await coordinator.async_initialize()
+
+        (rows,) = _calls_for(recorder_stats.async_add_external_statistics, coordinator.cost_statistic_id)
+        assert [r["start"] for r in rows] == [r["start"] for r in self.STATS]
+        assert [r["sum"] for r in rows] == pytest.approx([1.1, 1.3])
+        saved = mock_store.async_save.call_args[0][0]
+        assert saved["cost_price"] == 0.01
+        assert saved["cost_anchor_usage"] == 0.0
+        assert saved["cost_anchor_cost"] == 0.0
+
+    async def test_first_price_retried_when_history_import_fails(self, coordinator, mock_store):
+        usage = [{"start": self.STATS[0]["start"].timestamp(), "state": 10.0, "sum": 110.0}]
+        _, get_instance = _fake_recorder(usage_rows=usage, fail_cost=True)
+        coordinator._price = 0.01
+
+        with get_instance:
+            await coordinator.async_initialize()
+
+        assert coordinator._cost_price is None
+        mock_store.async_save.assert_not_called()
+
+    async def test_price_change_anchors_at_latest_sums(self, coordinator, mock_store):
+        mock_store.async_load.return_value = {
+            "current_sum": 130.0,
+            "last_processed_start": 1,
+            "external_stats_backfilled": True,
+            "cost_price": 0.01,
+            "cost_anchor_usage": 0.0,
+            "cost_anchor_cost": 0.0,
+        }
+        recorder_stats, get_instance = _fake_recorder(last_sums={
+            coordinator.statistic_id: 130.0,
+            coordinator.cost_statistic_id: 1.3,
+        })
+        coordinator._price = 0.02
+
+        with get_instance:
+            await coordinator.async_initialize()
+
+        assert coordinator._cost_price == 0.02
+        assert coordinator._cost_anchor_usage == 130.0
+        assert coordinator._cost_anchor_cost == 1.3
+        recorder_stats.statistics_during_period.assert_not_called()
+
+        coordinator._import_stats([
+            {"start": datetime(2024, 6, 6, 4, 0, 0, tzinfo=timezone.utc), "state": 10.0, "sum": 140.0},
+        ])
+        (rows,) = _calls_for(recorder_stats.async_add_external_statistics, coordinator.cost_statistic_id)
+        assert rows[0]["sum"] == pytest.approx(1.5)
+
+    async def test_clearing_price_stops_cost(self, coordinator, mock_store):
+        mock_store.async_load.return_value = {
+            "current_sum": 130.0,
+            "last_processed_start": 1,
+            "external_stats_backfilled": True,
+            "cost_price": 0.01,
+        }
+        recorder_stats, get_instance = _fake_recorder()
+
+        with get_instance:
+            await coordinator.async_initialize()
+
+        assert coordinator._cost_price is None
+        assert "cost_price" not in mock_store.async_save.call_args[0][0]
+        coordinator._import_stats(self.STATS)
+        assert _calls_for(recorder_stats.async_add_external_statistics, coordinator.cost_statistic_id) == []
+
+    async def test_unchanged_price_does_nothing(self, coordinator, mock_store):
+        mock_store.async_load.return_value = {
+            "current_sum": 130.0,
+            "last_processed_start": 1,
+            "external_stats_backfilled": True,
+            "cost_price": 0.01,
+        }
+        recorder_stats, get_instance = _fake_recorder()
+        coordinator._price = 0.01
+
+        with get_instance:
+            await coordinator.async_initialize()
+
+        recorder_stats.statistics_during_period.assert_not_called()
+        recorder_stats.get_last_statistics.assert_not_called()
+        mock_store.async_save.assert_not_called()

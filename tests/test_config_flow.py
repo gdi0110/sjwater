@@ -182,3 +182,40 @@ class TestValidateInput:
             with pytest.raises(CannotConnect):
                 await validate_input(hass, {"username": "test", "password": "test"})
             mock_client.async_verify_credentials.assert_called_once()
+
+
+class TestOptionsFlow:
+    def _make_options_flow(self, options=None):
+        from custom_components.sjwater.config_flow import OptionsFlow
+
+        flow = OptionsFlow()
+        entry = MagicMock()
+        entry.options = options or {}
+        with patch.object(OptionsFlow, "config_entry", entry, create=True):
+            yield flow
+
+    async def test_form_suggests_current_price(self):
+        for flow in self._make_options_flow({"price_per_gallon": 0.00754}):
+            result = await flow.async_step_init(user_input=None)
+            assert result["type"] == "form"
+            assert result["step_id"] == "init"
+            (key,) = result["data_schema"].schema
+            assert key == "price_per_gallon"
+            assert key.description["suggested_value"] == 0.00754
+
+    async def test_saves_price(self):
+        for flow in self._make_options_flow():
+            result = await flow.async_step_init(user_input={"price_per_gallon": 0.00754})
+            assert result["type"] == "create_entry"
+            assert result["data"] == {"price_per_gallon": 0.00754}
+
+    async def test_rejects_negative_price(self):
+        for flow in self._make_options_flow():
+            result = await flow.async_step_init(user_input=None)
+            with pytest.raises(vol.Invalid):
+                result["data_schema"]({"price_per_gallon": -1})
+
+    def test_config_flow_offers_options(self):
+        from custom_components.sjwater.config_flow import OptionsFlow
+
+        assert isinstance(ConfigFlow.async_get_options_flow(MagicMock()), OptionsFlow)

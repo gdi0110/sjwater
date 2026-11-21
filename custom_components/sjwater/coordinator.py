@@ -17,7 +17,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .api import SJWaterHubApiClient
-from .const import DOMAIN
+from .const import CONF_PRICE_PER_GALLON, DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry as SJWaterConfigEntry
@@ -49,6 +49,18 @@ STATISTIC_ID_SUFFIX = "water_usage"
 # Absent in state persisted by versions <= 0.0.2, which imported into the
 # sensor entity's series instead.
 STORE_KEY_EXTERNAL_STATS = "external_stats_backfilled"
+
+# Optional cost statistic ("sjwater:<acct>_water_cost"), written next to the
+# usage statistic when a price per gallon is set in the integration options.
+# The Energy dashboard only accepts a cost *statistic* for an external usage
+# statistic (a fixed price is rejected), so the integration has to supply it.
+# Each cost row is priced relative to an anchor: cost_sum = anchor_cost +
+# (usage_sum - anchor_usage) * price. A price change moves the anchor to the
+# latest row, so history keeps the old price and the cost sum never jumps.
+COST_STATISTIC_ID_SUFFIX = "water_cost"
+STORE_KEY_COST_PRICE = "cost_price"
+STORE_KEY_COST_ANCHOR_USAGE = "cost_anchor_usage"
+STORE_KEY_COST_ANCHOR_COST = "cost_anchor_cost"
 
 
 class SJWaterHubCoordinator(DataUpdateCoordinator):
@@ -91,6 +103,11 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         # entity's own statistics was restored: the already-finalized history
         # must be copied once into the external statistic.
         self._needs_backfill = False
+        price = (entry.options or {}).get(CONF_PRICE_PER_GALLON)
+        self._price: float | None = float(price) if price else None
+        self._cost_price: float | None = None
+        self._cost_anchor_usage = 0.0
+        self._cost_anchor_cost = 0.0
         self._initialized = False
         _LOGGER.debug("%s: Coordinator created", DOMAIN)
 
@@ -107,6 +124,9 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 self._last_processed_start is not None
                 and not stored.get(STORE_KEY_EXTERNAL_STATS)
             )
+            self._cost_price = stored.get(STORE_KEY_COST_PRICE)
+            self._cost_anchor_usage = stored.get(STORE_KEY_COST_ANCHOR_USAGE, 0.0)
+            self._cost_anchor_cost = stored.get(STORE_KEY_COST_ANCHOR_COST, 0.0)
             _LOGGER.debug(
                 "Restored from store: current_sum=%s, last_processed_start=%s",
                 self._current_sum,
@@ -130,6 +150,9 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             self._last_processed_start = clamped
             await self._async_save_state()
 
+        if self._price != self._cost_price:
+            await self._async_apply_price()
+
         _LOGGER.debug(
             "State recovery complete: sum=%s, last_processed=%s",
             self._current_sum,
@@ -139,11 +162,75 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
 
     async def _async_save_state(self) -> None:
         """Persist the finalized running sum and watermark."""
-        await self._store.async_save({
+        state = {
             "current_sum": self._current_sum,
             "last_processed_start": self._last_processed_start,
             STORE_KEY_EXTERNAL_STATS: not self._needs_backfill,
-        })
+        }
+        if self._cost_price is not None:
+            state[STORE_KEY_COST_PRICE] = self._cost_price
+            state[STORE_KEY_COST_ANCHOR_USAGE] = self._cost_anchor_usage
+            state[STORE_KEY_COST_ANCHOR_COST] = self._cost_anchor_cost
+        await self._store.async_save(state)
+
+    async def _async_apply_price(self) -> None:
+        """Start, re-anchor, or stop the cost statistic after a price change.
+
+        First price set: price every usage row already in the recorder, so
+        the cost history starts where the usage history does. Later change:
+        anchor at the latest usage and cost sums so only new rows use the new
+        price. Price cleared: stop writing cost; existing rows are kept.
+        """
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.components.recorder.statistics import (
+            get_last_statistics,
+            statistics_during_period,
+        )
+
+        recorder = get_instance(self.hass)
+        if self._price is None:
+            self._cost_price = None
+        elif self._cost_price is None:
+            rows = (await recorder.async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                datetime(2000, 1, 1, tzinfo=timezone.utc),
+                None,
+                {self.statistic_id},
+                "hour",
+                None,
+                {"state", "sum"},
+            )).get(self.statistic_id, [])
+            self._cost_anchor_usage = 0.0
+            self._cost_anchor_cost = 0.0
+            self._cost_price = self._price
+            if rows:
+                usage = [
+                    {
+                        "start": dt_util.utc_from_timestamp(row["start"]),
+                        "state": row.get("state") or 0.0,
+                        "sum": row.get("sum") or 0.0,
+                    }
+                    for row in rows
+                ]
+                if not self._import_cost_stats(usage):
+                    self._cost_price = None
+                    return
+                _LOGGER.info(
+                    "Priced %d hourly readings into %s",
+                    len(usage), self.cost_statistic_id,
+                )
+        else:
+            last_usage, last_cost = [
+                (await recorder.async_add_executor_job(
+                    get_last_statistics, self.hass, 1, stat_id, False, {"sum"}
+                )).get(stat_id, [{}])[0].get("sum") or 0.0
+                for stat_id in (self.statistic_id, self.cost_statistic_id)
+            ]
+            self._cost_anchor_usage = last_usage
+            self._cost_anchor_cost = last_cost
+            self._cost_price = self._price
+        await self._async_save_state()
 
     @property
     def account_id(self) -> str:
@@ -159,6 +246,11 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
     def statistic_id(self) -> str:
         """Return the external statistic id the hourly usage is imported to."""
         return f"{DOMAIN}:{self.account_id}_{STATISTIC_ID_SUFFIX}"
+
+    @property
+    def cost_statistic_id(self) -> str:
+        """Return the external statistic id the hourly cost is imported to."""
+        return f"{DOMAIN}:{self.account_id}_{COST_STATISTIC_ID_SUFFIX}"
 
     async def _async_update_data(self) -> dict:
         """Update data via scraping."""
@@ -449,9 +541,50 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
             _LOGGER.debug(
                 "Imported %d stats (last sum=%.1f)", len(stats), stats[-1]["sum"]
             )
-            return True
         except Exception as exc:  # noqa: BLE001 - never let stats break the poll
             _LOGGER.warning(
                 "Failed to import statistics into %s: %s", self.statistic_id, exc
+            )
+            return False
+        if self._cost_price is not None:
+            self._import_cost_stats(stats)
+        return True
+
+    def _import_cost_stats(self, usage: list[dict]) -> bool:
+        """Import the cost of the given usage rows into the cost statistic."""
+        from homeassistant.components.recorder.statistics import (
+            async_add_external_statistics,
+        )
+
+        price = self._cost_price or 0.0
+        rows = [
+            {
+                "start": row["start"],
+                "state": row["state"] * price,
+                "sum": self._cost_anchor_cost
+                + (row["sum"] - self._cost_anchor_usage) * price,
+            }
+            for row in usage
+        ]
+        metadata = {
+            "statistic_id": self.cost_statistic_id,
+            "source": DOMAIN,
+            "has_sum": True,
+            "name": "SJ Water Hub Water Cost",
+            "unit_class": None,
+            "unit_of_measurement": None,  # same as core Opower cost statistics
+        }
+        try:
+            from homeassistant.components.recorder.models import StatisticMeanType
+            metadata["mean_type"] = StatisticMeanType.NONE
+        except ImportError:
+            metadata["has_mean"] = False
+
+        try:
+            async_add_external_statistics(self.hass, metadata, rows)
+            return True
+        except Exception as exc:  # noqa: BLE001 - never let stats break the poll
+            _LOGGER.warning(
+                "Failed to import statistics into %s: %s", self.cost_statistic_id, exc
             )
             return False

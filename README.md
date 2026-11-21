@@ -95,6 +95,18 @@ hour it was consumed.
 > other sensors while those versions were installed cannot be recovered, and one last
 > `UNIQUE constraint failed` error may be logged at the top of the hour in which you upgrade.
 
+### Water cost (optional)
+
+The Energy dashboard won't apply a fixed price to an imported statistic like **SJ Water Hub Water Usage**, so the integration can write a matching cost statistic for you:
+
+1. Go to **Settings → Devices & services → SJ Water Hub → Configure**
+2. Enter your **price per gallon**, including any per-unit surcharges and taxes (SJ Water bills per CCF; 1 CCF = 748 gallons)
+3. In the Energy dashboard's water settings, choose **Use an entity tracking the total costs** and select **SJ Water Hub Water Cost**
+
+The first time you set a price, the integration prices all the usage history it has already imported. If you change the price later, the new price applies from then on and earlier hours keep the price they were recorded with. Clear the field to stop writing cost.
+
+The cost is a flat rate, so it won't follow SJ Water's monthly tiers, and it leaves out the fixed service charge. The portal also reports usage in steps of about 7.5 gallons (one cubic foot, rounded to whole gallons), so each hour's cost moves in steps of the same size.
+
 ## How It Works
 
 ### Authentication

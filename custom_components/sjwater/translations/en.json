@@ -18,5 +18,16 @@
                 "title": "Connect to SJ Water Hub"
             }
         }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Water cost",
+                "description": "Price per gallon, in your Home Assistant currency, including any per-unit surcharges and taxes. When set, the integration also writes a \"SJ Water Hub Water Cost\" statistic for the Energy dashboard. A new price applies from now on; earlier hours keep the price they were recorded with. Leave empty to turn cost tracking off.",
+                "data": {
+                    "price_per_gallon": "Price per gallon"
+                }
+            }
+        }
     }
 }
