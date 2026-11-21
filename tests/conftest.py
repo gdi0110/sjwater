@@ -98,6 +98,7 @@ def config_entry():
     entry.data = {"username": "test@example.com", "password": "password123"}
     entry.title = "SJ Water Hub"
     entry.runtime_data = None
+    entry.options = {}
     return entry
 
 
